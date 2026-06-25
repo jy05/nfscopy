@@ -116,17 +116,28 @@ $workerScript = {
     $block = @()
     try {
         if (Test-Path -LiteralPath $dest) {
-            # A prior run may have died after renaming into Final but before
-            # deleting the source. If contents match, finish that job so the
-            # source file cannot be stranded on the space-limited src mount.
+            # A file with this name already sits in main. Hash both to tell apart
+            # two situations that share a name but mean different things.
             $destHash = (Get-FileHash -LiteralPath $dest         -Algorithm MD5).Hash
             $srcHash  = (Get-FileHash -LiteralPath $Src.FullName -Algorithm MD5).Hash
-            if ($destHash -ne $srcHash) {
-                throw "destination exists with DIFFERENT content - not overwriting"
+            if ($destHash -eq $srcHash) {
+                # Same name AND same contents: this file is already delivered
+                # (e.g. a prior run copied it, then died before clearing the
+                # source). Finish that job by clearing the source; copy nothing.
+                Remove-Item -LiteralPath $Src.FullName -Force
+                Write-Block -Lines @(New-Note -Stage 'RECOVER' -Text "$rel  already in Final (hash match), source removed")
+                return 'OK'
             }
-            Remove-Item -LiteralPath $Src.FullName -Force
-            Write-Block -Lines @(New-Note -Stage 'RECOVER' -Text "$rel  already in Final (hash match), source removed")
-            return 'OK'
+            # Same name but DIFFERENT contents: a genuinely different file that
+            # happens to share a name (e.g. two sources both named Text1.txt).
+            # Keep both by giving the incoming one a date-time stamp in its name,
+            # landing it right where it would have gone. The original is untouched.
+            $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+            $rel   = Join-Path (Split-Path $rel) `
+                     ("{0}_{1}{2}" -f [IO.Path]::GetFileNameWithoutExtension($rel), $stamp, [IO.Path]::GetExtension($rel))
+            $proc  = Join-Path $ProcessingRoot $rel
+            $dest  = Join-Path $FinalRoot $rel
+            $block += New-Note -Stage 'COLLISION' -Text "differs from existing main copy; saving incoming as $rel"
         }
 
         # [INCOMING] hash of the source before copying.
