@@ -1,5 +1,5 @@
 <#
-sync-nfs.ps1 - verified, parallel move of files between two NFS mounts.
+nfstransferscript.ps1 - verified, parallel move of files between two mounts.
 
 Pipeline per run:
   1. Acquire exclusive lock on flock.lock; exit if another run holds it.
@@ -7,8 +7,10 @@ Pipeline per run:
      across a ProbeSeconds window. In-flight files wait for the next run.
   3. Workers (parallel, per file): hash source [INCOMING], copy to Processing,
      re-apply source timestamps/attributes, hash copy [PROCESSING], compare,
-     rename Processing -> Final (same mount), hash final [MAIN], delete source.
-     Each file's hash lines are written to the log as one grouped block.
+     rename Processing -> Final (same mount), hash final [MAIN], delete source
+     if no issues arise. Each file's hash lines are written to the log as one
+     grouped block. A same-name file with different contents is kept alongside
+     the original by adding a date-time stamp to the incoming name [COLLISION].
   4. Failure handling (collector, single-threaded): a file that fails keeps its
      source in incoming and is retried next run. A persistent attempt counter
      in StateFile survives between runs; on the MaxAttempts-th failure the source
@@ -22,16 +24,20 @@ Folder cleanup policy: incoming and processing are kept clear (verified files
 leave incoming; processing copies are overwritten on retry, deleted on give-up,
 and empty dirs are swept). MAIN is never deleted from - a bad file there means
 at-rest corruption and is the only surviving copy. FailedRoot is left for
-human inspection and is not auto-cleaned.
+manual inspection and is not auto-cleaned.
 
-Logging is silent unless a file moves, fails, or is given up: empty runs and
-in-flight-only runs write nothing.
+Logging is silent unless a file moves, collides, fails, or is given up: empty
+runs and in-flight-only runs write nothing.
+
+Operational files (lock, logs, state) live on local disk (C:), separate from
+the data mounts: share-mode locking is only reliable on local NTFS, and ops
+artifacts should never mix with delivered data in main.
 
 Exit code 0 = clean run (or skipped due to lock), 1 = one or more files failed.
 #>
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingBrokenHashAlgorithms', '',
-    Justification = 'MD5 is the verification algorithm required by the task spec. It guards transfer integrity, not a security boundary.')]
+    Justification = 'MD5 is the verification algorithm required by the task spec. It guards transfer integrity, but is not a security boundary.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
     Justification = 'Console echo for interactive runs only; the log file is the record and Write-Host keeps the output stream clean for worker results.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
@@ -40,17 +46,17 @@ Exit code 0 = clean run (or skipped due to lock), 1 = one or more files failed.
     Justification = 'False positive: LogFile is used by the Write-Block function nested inside the worker scriptblock; the rule does not trace nested function scopes.')]
 [CmdletBinding()]
 param(
-    [string]$SourceRoot     = 'S:\incoming',
-    [string]$ProcessingRoot = 'T:\processing',
-    [string]$FinalRoot      = 'T:\main',
-    [string]$FailedRoot     = 'T:\failed',                      # give-up files (on roomy dest mount)
-    [string]$LockFile       = 'C:\sync-nfs\flock.lock',
-    [string]$LogDir         = 'C:\sync-nfs\logs',
-    [string]$StateFile      = 'C:\sync-nfs\state\attempts.json', # persistent attempt counts
-    [int]$MinAgeMinutes     = 5,    # file must be untouched at least this long
-    [int]$ProbeSeconds      = 30,   # size/mtime must not change across this window
-    [int]$Workers           = 8,    # parallel per-file pipelines
-    [int]$MaxAttempts       = 3     # failures before a file is moved to FailedRoot
+    [string]$SourceRoot     = 'E:\incoming',                  # users drop files here (space-limited mount)
+    [string]$ProcessingRoot = 'D:\processing',                # staging area while a file is actively copied and verified
+    [string]$FinalRoot      = 'D:\main',                      # verified files land here (same mount as processing)
+    [string]$FailedRoot     = 'D:\failed',                    # give-up files; on the roomy dest mount so they never occupy space-limited incoming
+    [string]$LockFile       = 'C:\sync-nfs\flock.lock',       # single-instance lock; local NTFS only (share-mode locking is unreliable over NFS)
+    [string]$LogDir         = 'C:\sync-nfs\logs',             # hash/failure log; local disk, kept out of the data mounts
+    [string]$StateFile      = 'C:\sync-nfs\state\attempts.json', # persistent attempt counts; local disk
+    [int]$MinAgeMinutes     = 5,                              # file must be untouched at least this long (minutes)
+    [int]$ProbeSeconds      = 30,                             # size/mtime must not change across this window (seconds)
+    [int]$Workers           = 8,                              # parallel per-file pipelines
+    [int]$MaxAttempts       = 3                               # failures before a file is moved to FailedRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,7 +66,8 @@ $logFile = Join-Path $LogDir ("sync-{0:yyyyMMdd}.log" -f (Get-Date))
 
 # Write pre-formatted lines as one grouped block (trailing blank line separates
 # files). The mutex keeps each block contiguous across the parallel workers and
-# the collector. Nothing is written unless there are lines to report.
+# the collector. Nothing is written unless there are lines to report, which
+# keeps the logs clean from clutter.
 function Write-Block {
     param([string[]]$Lines)
     $mutex = New-Object System.Threading.Mutex($false, 'Local\sync-nfs-log')
@@ -121,9 +128,11 @@ $workerScript = {
             $destHash = (Get-FileHash -LiteralPath $dest         -Algorithm MD5).Hash
             $srcHash  = (Get-FileHash -LiteralPath $Src.FullName -Algorithm MD5).Hash
             if ($destHash -eq $srcHash) {
-                # Same name AND same contents: this file is already delivered
-                # (e.g. a prior run copied it, then died before clearing the
-                # source). Finish that job by clearing the source; copy nothing.
+                # Same name AND same contents at the same path: this file is
+                # already delivered (e.g. a prior run copied it, then died
+                # before clearing the source). Finish that job by clearing the
+                # source; copy nothing. A filesystem cannot hold two files at
+                # one path, so releasing the source here loses nothing.
                 Remove-Item -LiteralPath $Src.FullName -Force
                 Write-Block -Lines @(New-Note -Stage 'RECOVER' -Text "$rel  already in Final (hash match), source removed")
                 return 'OK'
@@ -131,13 +140,17 @@ $workerScript = {
             # Same name but DIFFERENT contents: a genuinely different file that
             # happens to share a name (e.g. two sources both named Text1.txt).
             # Keep both by giving the incoming one a date-time stamp in its name,
-            # landing it right where it would have gone. The original is untouched.
-            $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-            $rel   = Join-Path (Split-Path $rel) `
-                     ("{0}_{1}{2}" -f [IO.Path]::GetFileNameWithoutExtension($rel), $stamp, [IO.Path]::GetExtension($rel))
-            $proc  = Join-Path $ProcessingRoot $rel
-            $dest  = Join-Path $FinalRoot $rel
-            $block += New-Note -Stage 'COLLISION' -Text "differs from existing main copy; saving incoming as $rel"
+            # landing it right where it would have gone. The original in main is
+            # untouched.
+            $stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
+            $newName = "{0}_{1}{2}" -f `
+                [IO.Path]::GetFileNameWithoutExtension($rel), $stamp, [IO.Path]::GetExtension($rel)
+            $parent  = Split-Path $rel
+            $rel     = if ([string]::IsNullOrEmpty($parent)) { $newName }
+                       else { Join-Path $parent $newName }
+            $proc    = Join-Path $ProcessingRoot $rel
+            $dest    = Join-Path $FinalRoot $rel
+            $block  += New-Note -Stage 'COLLISION' -Text "differs from existing main copy; saving incoming as $rel"
         }
 
         # [INCOMING] hash of the source before copying.
@@ -169,9 +182,9 @@ $workerScript = {
         # [MAIN] hash read from the file in its final location, after the move.
         # The file was touched (renamed), so log its hash as it now sits in main.
         # A same-mount rename preserves content, so this equals PROCESSING under
-        # healthy storage; the logged hashes let a human spot at-rest corruption.
-        # We do NOT throw on a difference: the verified copy is already in main
-        # and is the only surviving copy once the source is released below.
+        # healthy storage; the logged hashes let a person spot at-rest corruption.
+        # We do NOT throw on a difference: the verified copy is already in main,
+        # and once the source is released below it is the only surviving copy.
         $mainHash = (Get-FileHash -LiteralPath $dest -Algorithm MD5).Hash
         $block += New-Line -Stage 'MAIN' -Rel $rel -Hash $mainHash
 
@@ -188,9 +201,10 @@ $workerScript = {
 }
 
 # --- 1. Lock: the held exclusive handle IS the lock. The file itself stays. ---
-    # Plain terms: make sure only one copy of this script runs at a time. We
-    # grab an exclusive hold on a small file; if another run already holds it,
-    # we quietly stop so two runs can never fight over the same files.
+# Makes sure only one copy of this script runs at a time. We grab an exclusive
+# hold on a small file; if another run already holds it, we quietly stop so two
+# runs can never fight over the same files. If the script is slow, increase
+# Workers (top of the script) rather than running multiple copies.
 try {
     $lock = [System.IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None')
 } catch {
@@ -200,10 +214,10 @@ try {
 $failCount = 0
 try {
     # --- 2. Manifest of stable files ---
-    # Plain terms: build the list of files that are safe to move this run. A file
-    # qualifies only if it has sat still for a while AND its size and timestamp
-    # stay identical across a short wait. A file still being written keeps
-    # changing, so it is left out and picked up on a later run.
+    # Build the list of files that are safe to move this run. A file qualifies
+    # only if it has sat still for a while AND its size and timestamp stay
+    # identical across a short wait. A file still being written keeps changing,
+    # so it is left out and picked up on a later run.
     $cutoff   = (Get-Date).AddMinutes(-$MinAgeMinutes)
     $snapshot = Get-ChildItem -LiteralPath $SourceRoot -Recurse -File |
                 Where-Object { $_.LastWriteTime -lt $cutoff }
@@ -237,8 +251,8 @@ try {
         }
 
         # --- 3. Dispatch manifest to the runspace pool ---
-        # Plain terms: hand each file to a pool of background workers so several
-        # files copy and verify at the same time instead of one after another.
+        # Hand each file to a pool of background workers so several files copy
+        # and verify at the same time instead of one after another.
         $pool = [runspacefactory]::CreateRunspacePool(1, $Workers)
         $pool.Open()
         try {
@@ -253,10 +267,10 @@ try {
             }
 
             # --- 4. Collect results (single-threaded) and handle failures ---
-            # Plain terms: gather each worker's result one at a time. On success we
-            # clear that file's failure record. On failure we count the attempt, and
-            # once a file has failed enough times we move it aside to the failed
-            # folder, remove its leftover copy from processing, and stop retrying it.
+            # Gather each worker's result one at a time. On success we clear that
+            # file's failure record. On failure we count the attempt, and once a
+            # file has failed enough times we move it aside to the failed folder,
+            # remove its leftover copy from processing, and stop retrying it.
             foreach ($job in $jobs) {
                 $result = $job.PS.EndInvoke($job.Handle)   # blocks until that worker is done
                 $job.PS.Dispose()
@@ -306,12 +320,12 @@ try {
         }
 
         # --- 5. Empty-directory cleanup: non-recursive delete, deepest first. ---
-        # Plain terms: tidy up by deleting folders that are now empty. The delete is
-        # deliberately the kind that refuses to remove a folder that still holds a
-        # file, which protects any folder whose large file is still arriving.
+        # Tidy up by deleting folders that are now empty. The delete is
+        # deliberately the kind that refuses to remove a folder that still holds
+        # a file, which protects any folder whose large file is still arriving.
         # DirectoryInfo.Delete() throws on non-empty dirs; that failure is the
-        # safety mechanism protecting dirs that still hold in-flight files. MAIN
-        # is intentionally not swept for content - only incoming and processing.
+        # safety mechanism. MAIN is intentionally not swept - only incoming and
+        # processing.
         foreach ($root in @($SourceRoot, $ProcessingRoot)) {
             Get-ChildItem -LiteralPath $root -Recurse -Directory |
                 Sort-Object { $_.FullName.Length } -Descending |
